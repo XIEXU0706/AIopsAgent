@@ -1,0 +1,22 @@
+{
+  "_comment": "SafetyAgent 高危操作规则库（外置配置）。修改无需改代码，重启服务即生效。pattern 为大小写不敏感正则。",
+  "rules": [
+    {"pattern": "\\bDROP\\s+(TABLE|DATABASE|INDEX|VIEW)\\b", "level": "critical", "label": "数据库删除操作"},
+    {"pattern": "\\bDELETE\\s+FROM\\b", "level": "high", "label": "数据库删除数据"},
+    {"pattern": "\\bTRUNCATE\\b", "level": "critical", "label": "数据库清空操作"},
+    {"pattern": "\\bALTER\\s+TABLE\\b", "level": "medium", "label": "数据库结构变更"},
+    {"pattern": "\\bUPDATE\\b.*\\bSET\\b", "level": "high", "label": "数据库数据修改"},
+    {"pattern": "\\brm\\s+-[rf]+\\b", "level": "critical", "label": "强制删除文件"},
+    {"pattern": "\\bshutdown\\b", "level": "critical", "label": "关机操作"},
+    {"pattern": "\\breboot\\b", "level": "critical", "label": "重启操作"},
+    {"pattern": "\\bkill\\s+-9\\b", "level": "high", "label": "强制杀进程"},
+    {"pattern": "\\bchmod\\s+777\\b", "level": "medium", "label": "修改文件权限为777"},
+    {"pattern": "\\bwget\\b", "level": "medium", "label": "下载外部文件"},
+    {"pattern": "\\bcurl\\b.*\\|.*\\bbash\\b", "level": "critical", "label": "管道执行远程脚本"},
+    {"pattern": "\\bflushall\\b", "level": "critical", "label": "Redis 清空全部数据"},
+    {"pattern": "\\bflushdb\\b", "level": "high", "label": "Redis 清空当前数据库"},
+    {"pattern": "\\bcluster\\s+failover\\b", "level": "high", "label": "Redis 手动故障转移"},
+    {"pattern": "\\breset\\s+master\\b", "level": "critical", "label": "MySQL 重置主库"},
+    {"pattern": "\\bstop\\s+slave\\b", "level": "high", "label": "MySQL 停止复制"}
+  ]
+}

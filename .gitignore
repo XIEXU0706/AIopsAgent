@@ -1,0 +1,21 @@
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.db
+
+# 个人文档 / 启动脚本不提交
+INTERVIEW_QA.md
+PROJECT_HIGHLIGHTS.md
+run.txt
+tests/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
+
+# 缓存
+.pytest_cache/

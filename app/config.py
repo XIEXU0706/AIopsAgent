@@ -48,6 +48,16 @@ class Settings:
         default_factory=lambda: int(os.getenv("CHAT_ARCHIVE_DAYS", "7"))
     )
 
+    # 知识库 embedding 后端
+    # auto: 装了 sentence-transformers 用 BGE 语义向量，否则降级哈希
+    # bge / hashing: 强制指定（bge 不可用时报错降级规则检索）
+    embedding_backend: str = field(
+        default_factory=lambda: os.getenv("EMBEDDING_BACKEND", "auto")
+    )
+    bge_model_name: str = field(
+        default_factory=lambda: os.getenv("BGE_MODEL_NAME", "BAAI/bge-small-zh-v1.5")
+    )
+
     # 工具队列
     tool_queue_rate: int = 10  # 每秒
     tool_queue_burst: int = 20

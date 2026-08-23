@@ -2,11 +2,16 @@
 
 - 文档上传（markdown 解析为案例）→ 向量化 → 存入 Chroma
 - 查询：输入告警特征文本，返回最相似故障案例
-- 无网络依赖：使用自研确定性 hashing embedding（crc32 特征哈希），
-  避免 Chroma 内置 ONNX 模型的首次下载，且跨进程稳定（重启后向量不失效）。
+- embedding 后端可切换（EMBEDDING_BACKEND）：
+  - bge:      BAAI/bge-small-zh-v1.5 语义向量（512 维，CPU 可跑），
+              检索侧加 bge 官方指令前缀提升召回
+  - hashing:  自研确定性特征哈希（crc32），零依赖、跨进程稳定
+  - auto（默认）: 安装了 sentence-transformers 则用 bge，否则降级 hashing；
+              bge 模型加载失败时同样自动降级，保证知识库能力不中断
 """
 
 import asyncio
+import importlib.util
 import logging
 import math
 import re
@@ -15,6 +20,8 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,8 @@ EMBED_DIM = 512
 # embedding 算法版本：升级算法后集合名随之变化，强制重建索引避免旧向量不兼容
 EMBEDDING_VERSION = "v2"
 COLLECTION_NAME = f"fault_cases_{EMBEDDING_VERSION}"
+# BGE 语义向量使用独立集合（向量空间与哈希不兼容，且文档需重新编码）
+BGE_COLLECTION_NAME = "fault_cases_bge_v1"
 
 try:
     # Chroma 1.x 需要 embedding function 实现 name/get_config/build_from_config/is_legacy
@@ -61,6 +70,13 @@ class HashingEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input):
         return [self._embed(text) for text in input]
 
+    # ── 统一编码接口（与 BGEEmbeddingFunction 对齐） ──
+    def encode_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed(t) for t in texts]
+
+    def encode_query(self, text: str) -> list[float]:
+        return self._embed(text)
+
     @staticmethod
     def _tokens(text: str) -> list[str]:
         """中文整段 + 2-gram + 英文词（蛇形标识符拆子词），提升跨语言召回"""
@@ -91,6 +107,93 @@ class HashingEmbeddingFunction(EmbeddingFunction):
         if norm > 0:
             vec = [x / norm for x in vec]
         return vec
+
+
+# bge 官方推荐的中文检索指令前缀：仅加在 query 侧，文档侧不加
+BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+
+
+def bge_available() -> bool:
+    """检测 sentence-transformers 是否已安装（不触发模型下载）"""
+    try:
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except Exception:
+        return False
+
+
+def resolve_embedding_backend(requested: str) -> str:
+    """把 auto 解析成实际可用的 backend（bge 不可用时降级 hashing）"""
+    if requested == "auto":
+        return "bge" if bge_available() else "hashing"
+    return requested
+
+
+class BGEEmbeddingFunction(EmbeddingFunction):
+    """BAAI/bge-small-zh-v1.5 语义 embedding（512 维，CPU 秒级推理）
+
+    - 构造零开销：模型懒加载，保证 Chroma 从 collection 元数据重建
+      EF 时不会触发模型下载
+    - 文档编码不加前缀；query 编码加 bge 官方检索指令前缀提升召回
+    - 输出 L2 归一化，配合 cosine 空间
+    """
+
+    def __init__(self, dim: int = EMBED_DIM, model_name: str = ""):
+        self.dim = dim
+        self.model_name = model_name or settings.bge_model_name
+        self._model = None  # 懒加载
+
+    @staticmethod
+    def name() -> str:
+        return "bge_small_zh_v1"
+
+    @staticmethod
+    def build_from_config(config: dict[str, Any]):
+        return BGEEmbeddingFunction(
+            dim=config.get("dim", EMBED_DIM),
+            model_name=config.get("model_name", ""),
+        )
+
+    def get_config(self) -> dict[str, Any]:
+        return {"dim": self.dim, "model_name": self.model_name}
+
+    def is_legacy(self) -> bool:
+        return False
+
+    def _load(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            logger.info("Loading BGE model: %s (首次运行需下载)", self.model_name)
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    def __call__(self, input):
+        return self.encode_documents(list(input))
+
+    # ── 统一编码接口 ──
+    def encode_documents(self, texts: list[str]) -> list[list[float]]:
+        model = self._load()
+        vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        return [v.tolist() for v in vecs]
+
+    def encode_query(self, text: str) -> list[float]:
+        model = self._load()
+        vec = model.encode(
+            [BGE_QUERY_PREFIX + text],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )[0]
+        return vec.tolist()
+
+
+# BGE embedder 进程级单例：模型加载耗时（秒级），必须全局复用
+_BGE_INSTANCE: Optional["BGEEmbeddingFunction"] = None
+
+
+def get_bge_embedder() -> "BGEEmbeddingFunction":
+    global _BGE_INSTANCE
+    if _BGE_INSTANCE is None:
+        _BGE_INSTANCE = BGEEmbeddingFunction()
+    return _BGE_INSTANCE
 
 
 # 内置故障案例（迁移自 RetrievalAgent 的规则知识库，作为开箱即用的种子数据）
@@ -228,15 +331,28 @@ def _extract_steps(block: str) -> str:
 
 
 class KnowledgeBaseService:
-    """Chroma 向量知识库"""
+    """Chroma 向量知识库（embedding 后端可切换：bge 语义 / hashing 词法）"""
 
-    def __init__(self, persist_dir: str = str(CHROMA_DIR)):
+    def __init__(self, persist_dir: str = str(CHROMA_DIR),
+                 embedding_backend: Optional[str] = None):
         self._persist_dir = persist_dir
+        # None → 跟随全局配置 settings.embedding_backend
+        self._requested_backend = embedding_backend
+        self._backend: Optional[str] = None  # 实际生效的 backend（_ensure 后确定）
         self._client = None
         self._collection = None
         self._init_error: Optional[str] = None
         self._lock = asyncio.Lock()
         self._seeded = False
+
+    @property
+    def backend_name(self) -> str:
+        """实际生效的 embedding 后端（bge / hashing；未初始化时返回解析后的请求值）"""
+        if self._backend:
+            return self._backend
+        return resolve_embedding_backend(
+            self._requested_backend or settings.embedding_backend
+        )
 
     # ── 初始化 ──────────────────────────────────────────
     def _ensure(self) -> None:
@@ -248,20 +364,44 @@ class KnowledgeBaseService:
             from chromadb.config import Settings
             from chromadb.utils.embedding_functions import register_embedding_function
 
+            requested = self._requested_backend or settings.embedding_backend
+            backend = resolve_embedding_backend(requested)
+
+            # bge 自检：模型加载/下载失败则降级 hashing，保证知识库能力不中断
+            embedder = None
+            if backend == "bge":
+                candidate = get_bge_embedder()
+                try:
+                    candidate.encode_query("embedding 自检")
+                    embedder = candidate
+                except Exception as e:
+                    logger.warning(
+                        "BGE 模型不可用(%s)，知识库降级为 hashing embedding", e)
+                    backend = "hashing"
+            if embedder is None:
+                embedder = HashingEmbeddingFunction()
+
             # 注册自定义 embedding function，重启后加载已有 collection 时才能重建
-            register_embedding_function(HashingEmbeddingFunction)
+            register_embedding_function(type(embedder))
 
             self._client = chromadb.PersistentClient(
                 path=self._persist_dir,
                 settings=Settings(anonymized_telemetry=False),
             )
             # 集合名带 embedding 版本：算法升级后自动换新集合重建，旧向量不兼容
-            self._collection = self._client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                embedding_function=HashingEmbeddingFunction(),
-                metadata={"hnsw:space": "cosine", "embedding_version": EMBEDDING_VERSION},
+            collection_name = (
+                BGE_COLLECTION_NAME if backend == "bge" else COLLECTION_NAME
             )
-            logger.info("Chroma knowledge base ready at %s", self._persist_dir)
+            self._collection = self._client.get_or_create_collection(
+                name=collection_name,
+                embedding_function=embedder,
+                metadata={"hnsw:space": "cosine", "embedding_version": backend},
+            )
+            self._backend = backend
+            logger.info(
+                "Chroma knowledge base ready at %s (embedding=%s)",
+                self._persist_dir, backend,
+            )
             self._seed_builtin_cases()
         except Exception as e:
             self._init_error = str(e)
@@ -415,9 +555,17 @@ class KnowledgeBaseService:
         if self._collection is None or self._collection.count() == 0:
             return []
         try:
-            result = self._collection.query(
-                query_texts=[text], n_results=min(top_k, 10),
-            )
+            if self._backend == "bge":
+                # 检索侧加 bge 指令前缀（文档入库时未加），显式传向量绕过自动编码
+                query_vector = get_bge_embedder().encode_query(text)
+                result = self._collection.query(
+                    query_embeddings=[query_vector],
+                    n_results=min(top_k, 10),
+                )
+            else:
+                result = self._collection.query(
+                    query_texts=[text], n_results=min(top_k, 10),
+                )
         except Exception as e:
             logger.warning("Chroma query failed: %s", e)
             return []
@@ -439,12 +587,14 @@ class KnowledgeBaseService:
             return {
                 "ready": False,
                 "error": self._init_error or "未初始化",
+                "backend": self.backend_name,
                 "doc_count": 0,
                 "case_count": 0,
             }
         return {
             "ready": True,
             "error": None,
+            "backend": self._backend,
             "doc_count": len(self.list_documents()),
             "case_count": self._collection.count(),
         }

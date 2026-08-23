@@ -12,7 +12,13 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import alert_router, chat_router, knowledge_router, notification_router
+from app.api import (
+    alert_router,
+    chat_router,
+    knowledge_router,
+    notification_router,
+    webhook_router,
+)
 from app.api.alert_routes import init_harness
 from app.config import settings
 from app.harness import AIOpsAgentHarness
@@ -49,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(knowledge_router)
     app.include_router(notification_router)
+    app.include_router(webhook_router)
 
     @app.get("/health")
     async def health():

@@ -91,11 +91,26 @@ def record_to_item(r: AlertRecord) -> AlertListItem:
 @router.post("", response_model=AlertResponse, status_code=202)
 async def ingest_alert(request: AlertRequest, background: BackgroundTasks):
     """接收告警事件，保存并启动异步处置流程"""
-    if harness is None:
-        return AlertResponse(alert_id="", status="error")
+    return submit_alert(request.model_dump(), background)
 
-    # 1. 立即保存告警（状态: processing）
-    alert = alert_store.create(request.model_dump())
+
+def submit_alert(payload: dict, background: BackgroundTasks) -> AlertResponse:
+    """告警接入核心逻辑：落库 + 建 trace + 后台异步处置。
+
+    供 POST /api/v1/alerts 与 Alertmanager webhook 复用。
+    """
+    if harness is None:
+        raise HTTPException(status_code=503, detail="harness not initialized")
+
+    # 1. 立即保存告警（状态: processing）；主键冲突（重复推送）时换新 id 重试一次
+    for attempt in range(2):
+        try:
+            alert = alert_store.create(payload)
+            break
+        except Exception:
+            if attempt == 1:
+                raise
+            payload = {**payload, "id": ""}  # 清空 id 让 store 自动生成
 
     # 2. 提前创建 trace_id，写入 alert 便于前端 SSE 连接
     trace_id = harness.create_trace(alert.id)
@@ -104,7 +119,7 @@ async def ingest_alert(request: AlertRequest, background: BackgroundTasks):
     # 3. 后台执行完整处置链路
     async def process():
         try:
-            result = await harness.process_alert(request.model_dump(), trace_id=trace_id)
+            result = await harness.process_alert(payload, trace_id=trace_id)
             # 4. 处理完成，更新存储
             alert_store.complete(alert.id, result.trace_id, result.report,
                                  skill_results=result.skill_results,

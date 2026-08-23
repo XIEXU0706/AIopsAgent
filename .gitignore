@@ -19,3 +19,6 @@ frontend/.npm-cache/
 
 # 缓存
 .pytest_cache/
+
+# 面试问题
+面试准备-简历深挖问题.md

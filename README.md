@@ -11,7 +11,8 @@
 - **多 Agent 协作（HEARSAY-II 黑板模式）**：以 `CollaborationBlackboard` 为共享协作空间，Coordinator 发布任务、Specialist Agent 按能力原子认领（`asyncio.Lock` 保证不重复执行）、执行后以 Artifact 写回黑板并广播事件，Agent 间完全解耦、可动态扩展。
 - **安全护栏（Guardrails）双层防护**：`SafetyAgent` 第一层 17 条正则规则硬拦截高危操作（DROP / TRUNCATE / DELETE / rm -rf / flushall 等），第二层 LLM 语义级风险评级捕获「回滚版本、跨 AZ 切换」等隐式高危意图，高危操作强制人工复核。
 - **处置预案动态加载**：`AIOpsSkillRegistry` 扫描 `SKILL.md` 按告警类型（error_type）匹配处置计划，**新增预案只需放一个 markdown 文件，不用改代码**；高风险场景自动叠加安全审查，并生成结构化交接摘要。
-- **RAG 故障知识检索**：`RetrievalAgent` 基于 Chroma 向量库检索历史故障案例，中文 2-gram + 英文分词关键词匹配兜底；本地评估 HitRate≈0.97 / MRR≈0.91。
+- **RAG 故障知识检索（双 embedding 后端可切换）**：`RetrievalAgent` 基于 Chroma 向量库检索历史故障案例；`EMBEDDING_BACKEND=bge` 启用 `bge-small-zh-v1.5` 语义向量（CPU 可跑，query 侧加检索指令前缀），未安装 sentence-transformers 时自动降级为中文 2-gram 哈希 embedding，无网络依赖开箱即用；独立改写评测集对比实验见 `scripts/rag_eval.py`。
+- **Prometheus Alertmanager 对接**：`POST /api/v1/webhook/alertmanager` 接收 Alertmanager v4 标准推送，labels/annotations 全量保留供检索 Agent 提取关键词；resolved 通知自动过滤、重复 fingerprint 幂等受理；`scripts/mock_alertmanager.py` 可模拟真实告警源持续推送。
 - **MCP 工具异步队列**：报告导出（JSON/Markdown/Excel .xlsx）、预警发送（落库 + 可选 Webhook 真实推送）、备注追加等工具经 `AsyncToolQueue` 异步入队、后台消费，主流程不阻塞；队列支持**幂等去重、令牌桶限流、指数退避重试、失败隔离与 Dead Letter Queue**，任务状态经 **SSE 实时推送**前端。
 - **分层记忆 + 上下文压缩**：短期 Redis 热窗口 + 长期 MySQL（`chat_kv` 表 + 联合索引）+ SQLite 兜底；长对话经「保留最近 N 条 + 摘要压缩」生成 `memoryBrief`，避免 prompt 膨胀，支持可配置归档。
 - **全链路 LLM 规则降级**：日志分析、知识检索、跨 Agent 归纳、安全评级在 LLM 不可用时均自动降级为规则实现，系统在无 Key 环境下开箱即用。
@@ -123,6 +124,8 @@ curl http://127.0.0.1:9092/health
 | `DEEPSEEK_API_KEY` | DeepSeek Key，不配则走规则降级 | 空 |
 | `KIMI_API_KEY` | Kimi Key（智能问答用） | 空 |
 | `KIMI_CHAT_MODEL` | 对话模型 | `kimi-k2.6` |
+| `EMBEDDING_BACKEND` | 知识库 embedding：`auto`（装了 sentence-transformers 用 BGE）/ `bge` / `hashing` | `auto` |
+| `BGE_MODEL_NAME` | BGE 语义模型（512 维，CPU 可跑） | `BAAI/bge-small-zh-v1.5` |
 | `LONG_TERM_BACKEND` | 长期记忆后端 `mysql` / `sqlite` | `mysql` |
 | `MYSQL_DSN` | MySQL 连接串（不可用时自动降级 SQLite） | `mysql://root:123456@localhost:3306/aiopsAgent` |
 | `CHAT_ARCHIVE_DAYS` | 会话归档保留天数，0=不归档 | `7` |
@@ -135,6 +138,7 @@ curl http://127.0.0.1:9092/health
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/alerts` | 提交告警，触发多 Agent 处置 |
+| `POST` | `/api/v1/webhook/alertmanager` | 接收 Prometheus Alertmanager v4 webhook 推送 |
 | `GET` | `/api/v1/alerts` | 告警列表 |
 | `GET` | `/api/v1/alerts/{alert_id}` | 告警详情（含处置报告、备注 notes、交接摘要） |
 | `GET` | `/api/v1/alerts/{trace_id}/events` | SSE 事件流（任务状态实时推送） |
@@ -148,8 +152,59 @@ curl http://127.0.0.1:9092/health
 
 ## 工程验证
 
-- 本地 `pytest` 38 个用例，覆盖 **Risk Safety / Agent Routing / Standard Skills / RAG / API / Tool Queue** 六类核心链路。
-- RAG 检索质量评估：HitRate≈0.97 / MRR≈0.91（`scripts/rag_eval.py` 可复现）。
+- 本地 `pytest` 42+ 用例，覆盖 **Risk Safety / Agent Routing / Standard Skills / RAG / API / Tool Queue / Alertmanager Webhook** 七类核心链路。
+
+### RAG 检索质量：哈希 vs 语义 embedding 对比实验
+
+```bash
+pip install sentence-transformers   # 语义后端（可选，CPU 可跑）
+python scripts/rag_eval.py          # 四象限对比：{hashing, bge} × {exact, paraphrase}
+```
+
+两种评测口径：
+
+| 口径 | query 来源 | 意义 |
+|---|---|---|
+| exact | 案例症状原文 | 同分布基线（历史口径，必然偏高） |
+| paraphrase | 独立改写的运维口语描述（规避原文关键词） | 模拟真实告警与知识库措辞不一致，考察语义泛化 |
+
+评测在独立临时目录建库，不污染生产数据。**关注点：paraphrase 口径下 bge 相对 hashing 的增益**——这是语义向量相对词法匹配的真实价值，可直接作为技术选型依据写入报告。
+
+### 压测基准（Locust）
+
+```bash
+pip install locust
+uvicorn app.main:app --port 9092    # 建议（可选）无 LLM Key 模式：测纯工程吞吐
+
+# 50 并发、每秒递增 5、持续 60s，CSV 输出含 P99
+locust -f scripts/load_test.py --headless -u 50 -r 5 -t 60s \
+    --host http://127.0.0.1:9092 --csv results/loadtest
+```
+
+压测场景：告警接入（`POST /api/v1/alerts`）、Alertmanager webhook、告警列表查询、健康检查基线。读 `results/loadtest_stats.csv` 的 `Requests/s`（QPS）与 `99%` 列（P99 延迟，ms）。
+
+告警接入为 202 异步受理（BackgroundTasks 后台处置），**接口吞吐不受 LLM/处置耗时影响**——这是接入层与处置层解耦的验证点。注意：压测会产生真实告警处置数据，跑完可清理 `data/reports/`。
+
+### Alertmanager 真实告警源对接
+
+```bash
+# 启动服务后，用内置模拟器推送 Prometheus 风格告警（mysql/redis/disk/cpu/http）
+python scripts/mock_alertmanager.py --alert mysql          # 单发指定类型
+python scripts/mock_alertmanager.py --count 20 --interval 0.5
+python scripts/mock_alertmanager.py --loop --interval 2    # 持续告警流
+```
+
+真实 Alertmanager 只需在 `alertmanager.yml` 配置：
+
+```yaml
+receivers:
+  - name: "mindbridge"
+    webhook_configs:
+      - url: "http://<host>:9092/api/v1/webhook/alertmanager"
+        send_resolved: true
+```
+
+接入行为：firing 告警逐条进入多 Agent 处置链路（labels/annotations 全量保留，供检索 Agent 提取关键词）；resolved 通知过滤；重复 fingerprint 幂等受理。
 
 ---
 
@@ -172,7 +227,7 @@ MindBridge-AIOps/
 │   ├── models/                 # DispositionReport / Trace / Severity
 │   └── api/                    # alert / chat / knowledge / notification 路由
 ├── frontend/                   # Vue 2.7 + Element UI + ECharts
-├── scripts/                    # rag_eval.py（RAG 评估脚本）
+├── scripts/                    # rag_eval.py（RAG 对比评测）/ mock_alertmanager.py（告警源模拟）/ load_test.py（Locust 压测）
 ├── requirements.txt
 └── pytest.ini
 ```

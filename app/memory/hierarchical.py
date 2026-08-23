@@ -12,7 +12,10 @@
 
 压缩策略：
   1. 保留最近 N 条完整消息 (memory_recent_count)
-  2. 更早的历史 → 窗口裁剪 + 摘要压缩 → MemoryBrief
+  2. 更早的历史 → 语义压缩 → MemoryBrief
+     - 开启 memory_use_llm_compress 时，调用 LLM（DeepSeek/Kimi）将旧历史
+       滚动压缩为要点摘要（保留诉求/已排查步骤/待办/关键实体）
+     - LLM 不可用或关闭时，降级为规则拼接（窗口裁剪 + 截断）
   3. 总长度受 max_tokens 限制
 """
 
@@ -117,25 +120,86 @@ class HierarchicalMemory:
             return MemoryBrief(**data)
         return MemoryBrief()
 
+    COMPRESS_PROMPT = (
+        "你是智能运维对话压缩器。请把以下历史对话压缩为一份简洁的要点摘要，"
+        "必须保留：1) 用户的核心诉求；2) 已排查/已执行的步骤与结论；"
+        "3) 尚未解决的问题与待办项；4) 关键实体（IP、服务名、告警ID、错误码）。"
+        "用中文分点输出，不要遗漏任何待办项，不要编造未提及的信息。\n\n"
+        "历史对话：\n{history}"
+    )
+
     async def _compress(self, brief: dict) -> dict:
-        """窗口裁剪 + 摘要压缩"""
+        """窗口裁剪 + 语义压缩。
+
+        最近 N 条完整保留；更早的历史：
+        - 开启 memory_use_llm_compress 时调用 LLM 滚动压缩（见 _llm_compress）
+        - 否则 / LLM 不可用时降级为规则拼接（见 _rule_compress）
+        """
         recent = brief.get("recent_messages", [])
-        # 保留最近 N 条
-        keep = recent[-self.recent_count:]
-        # 旧消息做摘要
-        old = recent[:-self.recent_count]
-        summary_parts = []
-        for msg in old:
-            summary_parts.append(f"[{msg['role']}]: {msg['content'][:100]}")
-        summary = "\n".join(summary_parts) if summary_parts else brief.get("summary", "")
-        if summary:
-            summary = summary[-2000:]  # 截断防止过长
+        keep = recent[-self.recent_count:]          # 最近 N 条完整保留
+        old = recent[:-self.recent_count]           # 待压缩的旧历史
+
+        prev_summary = brief.get("summary", "")
+        if not old:
+            return {
+                "summary": prev_summary,
+                "recent_messages": keep,
+                "message_count": brief.get("message_count", 0),
+            }
+
+        if settings.memory_use_llm_compress:
+            summary = await self._llm_compress(old, prev_summary)
+        else:
+            summary = self._rule_compress(old, prev_summary)
 
         return {
             "summary": summary,
             "recent_messages": keep,
             "message_count": brief.get("message_count", 0),
         }
+
+    def _rule_compress(self, old: list, prev_summary: str) -> str:
+        """规则拼接降级：每条旧消息取前 100 字，整体截断 2000 字符。"""
+        parts = [f"[{m['role']}]: {m['content'][:100]}" for m in old]
+        summary = "\n".join(parts) if parts else prev_summary
+        if prev_summary:
+            summary = prev_summary + "\n" + summary
+        return summary[-2000:]  # 截断防止过长
+
+    async def _llm_compress(self, old: list, prev_summary: str) -> str:
+        """LLM 滚动语义压缩：把旧历史 + 上一轮摘要压成新的要点摘要。
+
+        滚动摘要（rolling summary）保证跨多轮压缩时早期语义不流失；
+        LLM 调用失败则降级为规则拼接，保证主流程可用。
+        """
+        history = "\n".join(f"[{m['role']}]: {m['content']}" for m in old)
+        # 喂给 LLM 的历史也做长度上限保护，避免撑爆压缩请求本身
+        budget = self.max_tokens * 2
+        if len(history) > budget:
+            history = history[-budget:]
+
+        try:
+            provider = settings.memory_compress_provider
+            if provider == "kimi":
+                from app.llm.kimi import KimiClient
+                client = KimiClient()
+            else:
+                from app.llm.deepseek import DeepSeekClient
+                client = DeepSeekClient()
+            raw = await client.chat([
+                {"role": "system", "content": self.COMPRESS_PROMPT.format(history=history)},
+            ])
+            # 滚动：新摘要 = 旧摘要 + 本轮压缩结果，再截断到预算内
+            new_summary = (prev_summary + "\n" + raw).strip() if prev_summary else raw
+            return new_summary[-self.max_tokens * 4:]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("memory LLM compress failed, fallback to rule: %s", e)
+            return self._rule_compress(old, prev_summary)
+        finally:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def clear(self, session_id: str) -> None:
         key = f"memory:{session_id}"

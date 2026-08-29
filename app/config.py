@@ -57,11 +57,32 @@ class Settings:
     bge_model_name: str = field(
         default_factory=lambda: os.getenv("BGE_MODEL_NAME", "BAAI/bge-small-zh-v1.5")
     )
+    bge_dim: int = field(
+        default_factory=lambda: int(os.getenv("BGE_DIM", "512"))
+    )
+    # RAG 检索增强
+    # hybrid: 向量召回 + 关键词（2-gram 词频）召回，RRF 融合
+    rag_hybrid: bool = field(
+        default_factory=lambda: os.getenv("RAG_HYBRID", "true").lower() == "true"
+    )
+    # rerank: 召回候选经 LLM 重排；关闭或 LLM 不可用时回退本地词重叠重排
+    rag_rerank: bool = field(
+        default_factory=lambda: os.getenv("RAG_RERANK", "true").lower() == "true"
+    )
+    rag_recall: int = field(
+        default_factory=lambda: int(os.getenv("RAG_RECALL", "10"))
+    )
 
     # 工具队列
     tool_queue_rate: int = 10  # 每秒
     tool_queue_burst: int = 20
     tool_max_retries: int = 3
+
+    # Prometheus 指标查询（query_metrics MCP 工具使用）
+    prometheus_url: str = field(
+        default_factory=lambda: os.getenv("PROMETHEUS_URL", "http://127.0.0.1:9090")
+    )
+    prometheus_timeout: float = 5.0
 
     # MCP 工具
     # 报告/Excel 导出落盘目录

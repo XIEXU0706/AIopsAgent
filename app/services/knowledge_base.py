@@ -32,8 +32,6 @@ EMBED_DIM = 512
 # embedding 算法版本：升级算法后集合名随之变化，强制重建索引避免旧向量不兼容
 EMBEDDING_VERSION = "v2"
 COLLECTION_NAME = f"fault_cases_{EMBEDDING_VERSION}"
-# BGE 语义向量使用独立集合（向量空间与哈希不兼容，且文档需重新编码）
-BGE_COLLECTION_NAME = "fault_cases_bge_v1"
 
 try:
     # Chroma 1.x 需要 embedding function 实现 name/get_config/build_from_config/is_legacy
@@ -129,27 +127,29 @@ def resolve_embedding_backend(requested: str) -> str:
 
 
 class BGEEmbeddingFunction(EmbeddingFunction):
-    """BAAI/bge-small-zh-v1.5 语义 embedding（512 维，CPU 秒级推理）
+    """BAAI/bge 语义 embedding（维度/模型名可配置，默认 small 512 维）
 
     - 构造零开销：模型懒加载，保证 Chroma 从 collection 元数据重建
       EF 时不会触发模型下载
     - 文档编码不加前缀；query 编码加 bge 官方检索指令前缀提升召回
     - 输出 L2 归一化，配合 cosine 空间
+    - 通过 BGE_MODEL_NAME / BGE_DIM 切换 bge-large（1024 维）等更大模型，
+      不同模型使用独立集合名（见 _bge_collection_for），避免向量空间不兼容
     """
 
-    def __init__(self, dim: int = EMBED_DIM, model_name: str = ""):
-        self.dim = dim
+    def __init__(self, dim: int = 0, model_name: str = ""):
+        self.dim = dim or settings.bge_dim or EMBED_DIM
         self.model_name = model_name or settings.bge_model_name
         self._model = None  # 懒加载
 
     @staticmethod
     def name() -> str:
-        return "bge_small_zh_v1"
+        return "bge_embedding_v1"
 
     @staticmethod
     def build_from_config(config: dict[str, Any]):
         return BGEEmbeddingFunction(
-            dim=config.get("dim", EMBED_DIM),
+            dim=config.get("dim", 0),
             model_name=config.get("model_name", ""),
         )
 
@@ -172,7 +172,9 @@ class BGEEmbeddingFunction(EmbeddingFunction):
     # ── 统一编码接口 ──
     def encode_documents(self, texts: list[str]) -> list[list[float]]:
         model = self._load()
-        vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        vecs = model.encode(
+            texts, normalize_embeddings=True, show_progress_bar=False
+        )
         return [v.tolist() for v in vecs]
 
     def encode_query(self, text: str) -> list[float]:
@@ -183,6 +185,12 @@ class BGEEmbeddingFunction(EmbeddingFunction):
             show_progress_bar=False,
         )[0]
         return vec.tolist()
+
+
+def _bge_collection_for(model_name: str) -> str:
+    """不同 bge 模型向量维度不同，用模型短名隔离集合，避免旧向量不兼容"""
+    short = model_name.split("/")[-1].lower().replace("-", "_")
+    return f"fault_cases_bge_{short}_v1"
 
 
 # BGE embedder 进程级单例：模型加载耗时（秒级），必须全局复用
@@ -389,9 +397,10 @@ class KnowledgeBaseService:
                 settings=Settings(anonymized_telemetry=False),
             )
             # 集合名带 embedding 版本：算法升级后自动换新集合重建，旧向量不兼容
-            collection_name = (
-                BGE_COLLECTION_NAME if backend == "bge" else COLLECTION_NAME
-            )
+            if backend == "bge":
+                collection_name = _bge_collection_for(self.bge_model_name)
+            else:
+                collection_name = COLLECTION_NAME
             self._collection = self._client.get_or_create_collection(
                 name=collection_name,
                 embedding_function=embedder,
@@ -549,36 +558,164 @@ class KnowledgeBaseService:
             "case_count": len(cases),
         }
 
+    # ── 检索增强：关键词召回 / RRF 融合 / 重排 ──────────────
+    @staticmethod
+    def _keyword_scores(text: str, documents: list[str]) -> dict[int, float]:
+        """基于中文 2-gram + 英文词频的关键词召回（与 HashingEmbeddingFunction
+        共用同一套分词），返回 doc_idx -> TF 分数。用于混合检索的关键词侧。
+        """
+        def tokens(t: str) -> list[str]:
+            toks: list[str] = []
+            for seg in re.findall(r"[一-龥]+", t):
+                if len(seg) == 1:
+                    toks.append(seg)
+                else:
+                    toks.extend(seg[i:i + 2] for i in range(len(seg) - 1))
+            for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_]*", t.lower()):
+                toks.append(w)
+                toks.extend(p for p in w.split("_") if p)
+            return toks
+
+        q_tokens = tokens(text)
+        q_set = set(q_tokens)
+        if not q_set:
+            return {}
+        scores: dict[int, float] = {}
+        for idx, doc in enumerate(documents):
+            d_tokens = tokens(doc)
+            if not d_tokens:
+                continue
+            hit = sum(1 for t in d_tokens if t in q_set)
+            # 归一化命中率，避免长文档天然占优
+            scores[idx] = hit / len(d_tokens)
+        return scores
+
+    @staticmethod
+    def _rrf(rank_lists: list[list[int]], k: int = 60) -> list[int]:
+        """Reciprocal Rank Fusion：把多路召回的 rank 列表融合成一个排序"""
+        fused: dict[int, float] = {}
+        for ranks in rank_lists:
+            for pos, idx in enumerate(ranks):
+                fused[idx] = fused.get(idx, 0.0) + 1.0 / (k + pos + 1)
+        return sorted(fused, key=lambda i: fused[i], reverse=True)
+
+    def _rerank_local(self, text: str, candidates: list[dict]) -> list[dict]:
+        """本地重排（离线可用）：用 query 与候选文本的 token 重叠度重算分数。
+        作为 LLM 重排的降级方案，不依赖任何外部模型。
+        """
+        def overlap(a: str, b: str) -> float:
+            ta, tb = set(HashingEmbeddingFunction._tokens(a)), set(HashingEmbeddingFunction._tokens(b))
+            if not ta or not tb:
+                return 0.0
+            return len(ta & tb) / (len(ta | tb) ** 0.5)
+
+        scored = []
+        for c in candidates:
+            blob = " ".join(filter(None, [
+                c.get("title", ""), c.get("symptom", ""),
+                c.get("root_cause", ""), c.get("solution", ""),
+            ]))
+            c = dict(c)
+            c["rerank_score"] = round(overlap(text, blob), 4)
+            scored.append(c)
+        scored.sort(key=lambda x: x["rerank_score"], reverse=True)
+        return scored
+
+    def _rerank_llm(self, text: str, candidates: list[dict]) -> list[dict]:
+        """LLM 重排：把候选案例与 query 一起发给 LLM，让其按相关性排序。
+        未配置 API key 或调用异常时自动回退本地重排。
+        """
+        try:
+            client = None
+            # 按已配置的 API key 选择 LLM（config 无统一 provider 字段）
+            if settings.deepseek_api_key:
+                from app.llm.deepseek import DeepSeekClient
+                client = DeepSeekClient()
+            elif settings.kimi_api_key:
+                from app.llm.kimi import KimiClient
+                client = KimiClient()
+            if client is None:
+                return self._rerank_local(text, candidates)
+
+            items = "\n".join(
+                f"[{i}] {c.get('title','')}｜症状:{c.get('symptom','')}｜根因:{c.get('root_cause','')}"
+                for i, c in enumerate(candidates)
+            )
+            prompt = (
+                "你是故障检索重排器。给定告警描述，对候选案例按与告警的相关性从高到低排序，"
+                "只输出相关性最高的案例编号（逗号分隔，最多5个），不要解释。\n"
+                f"告警: {text}\n候选:\n{items}\n排序:"
+            )
+            resp = client.chat(prompt)
+            order = [int(x) for x in re.findall(r"\d+", resp) if x.isdigit()]
+            picked = []
+            for i in order:
+                if 0 <= i < len(candidates):
+                    picked.append(candidates[i])
+            # 未被 LLM 选中的保持原序补在后面，保证不丢候选
+            seen = set(order)
+            picked += [c for i, c in enumerate(candidates) if i not in seen]
+            for c in picked:
+                c["rerank_score"] = c.get("rerank_score", 1.0)
+            return picked
+        except Exception as e:
+            logger.warning("LLM rerank failed, fallback local: %s", e)
+            return self._rerank_local(text, candidates)
+
     # ── 检索 ────────────────────────────────────────────
     def query(self, text: str, top_k: int = 3) -> list[dict]:
         self._ensure()
         if self._collection is None or self._collection.count() == 0:
             return []
+
+        recall = max(top_k, min(settings.rag_recall, 10))
         try:
+            # 1) 向量召回
             if self._backend == "bge":
-                # 检索侧加 bge 指令前缀（文档入库时未加），显式传向量绕过自动编码
                 query_vector = get_bge_embedder().encode_query(text)
-                result = self._collection.query(
-                    query_embeddings=[query_vector],
-                    n_results=min(top_k, 10),
+                vec_result = self._collection.query(
+                    query_embeddings=[query_vector], n_results=recall,
                 )
             else:
-                result = self._collection.query(
-                    query_texts=[text], n_results=min(top_k, 10),
+                vec_result = self._collection.query(
+                    query_texts=[text], n_results=recall,
                 )
+            vec_ids = (vec_result.get("ids") or [[]])[0]
+            vec_meta = (vec_result.get("metadatas") or [[]])[0]
+            vec_docs = (vec_result.get("documents") or [[]])[0]
+            vec_rank = list(range(len(vec_ids)))
         except Exception as e:
             logger.warning("Chroma query failed: %s", e)
             return []
-        metadatas = (result.get("metadatas") or [[]])[0]
-        return [
+
+        # 2) 混合检索：关键词召回（仅当开启 hybrid 且有向量召回时融合）
+        rank_lists = [vec_rank]
+        if settings.rag_hybrid and vec_docs:
+            kw_scores = self._keyword_scores(text, vec_docs)
+            kw_rank = [i for i, _ in sorted(
+                kw_scores.items(), key=lambda kv: kv[1], reverse=True
+            ) if i < len(vec_ids)]
+            if kw_rank:
+                rank_lists.append(kw_rank)
+
+        fused = self._rrf(rank_lists)
+        candidates = [
             {
-                "title": m.get("title", ""),
-                "symptom": m.get("symptom", ""),
-                "root_cause": m.get("root_cause", ""),
-                "solution": m.get("solution", ""),
+                "id": vec_ids[i],
+                "title": vec_meta[i].get("title", ""),
+                "symptom": vec_meta[i].get("symptom", ""),
+                "root_cause": vec_meta[i].get("root_cause", ""),
+                "solution": vec_meta[i].get("solution", ""),
+                "doc_id": vec_meta[i].get("doc_id", ""),
             }
-            for m in metadatas
+            for i in fused
         ]
+
+        # 3) 重排（rerank）：LLM 优先，失败回退本地词重叠
+        if settings.rag_rerank:
+            candidates = self._rerank_llm(text, candidates)
+
+        return candidates[:top_k]
 
     # ── 统计 / 模板 ─────────────────────────────────────
     def stats(self) -> dict:

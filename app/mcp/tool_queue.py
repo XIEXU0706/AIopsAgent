@@ -75,7 +75,7 @@ class AsyncToolQueue:
         self._completed: dict[str, ToolResult] = {}
         self._rate_limiter = TokenBucket(rate, burst)
         self._dlq: list[ToolTask] = []
-        self._max_dlq = max_dlq
+        self._max_dlq = max_dlq  # 死信队列
         self._handlers: dict[str, Callable] = {}
         self._processed_ids: set[str] = set()  # 幂等
         self._running = False

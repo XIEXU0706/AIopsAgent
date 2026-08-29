@@ -11,7 +11,7 @@
 - **多 Agent 协作（HEARSAY-II 黑板模式）**：以 `CollaborationBlackboard` 为共享协作空间，Coordinator 发布任务、Specialist Agent 按能力原子认领（`asyncio.Lock` 保证不重复执行）、执行后以 Artifact 写回黑板并广播事件，Agent 间完全解耦、可动态扩展。
 - **安全护栏（Guardrails）双层防护**：`SafetyAgent` 第一层 17 条正则规则硬拦截高危操作（DROP / TRUNCATE / DELETE / rm -rf / flushall 等），第二层 LLM 语义级风险评级捕获「回滚版本、跨 AZ 切换」等隐式高危意图，高危操作强制人工复核。
 - **处置预案动态加载**：`AIOpsSkillRegistry` 扫描 `SKILL.md` 按告警类型（error_type）匹配处置计划，**新增预案只需放一个 markdown 文件，不用改代码**；高风险场景自动叠加安全审查，并生成结构化交接摘要。
-- **RAG 故障知识检索（双 embedding 后端可切换）**：`RetrievalAgent` 基于 Chroma 向量库检索历史故障案例；`EMBEDDING_BACKEND=bge` 启用 `bge-small-zh-v1.5` 语义向量（CPU 可跑，query 侧加检索指令前缀），未安装 sentence-transformers 时自动降级为中文 2-gram 哈希 embedding，无网络依赖开箱即用；独立改写评测集对比实验见 `scripts/rag_eval.py`。
+- **RAG 故障知识检索（双 embedding 后端可切换）**：`RetrievalAgent` 基于 Chroma 向量库检索历史故障案例；`EMBEDDING_BACKEND=bge` 启用 `bge-small-zh-v1.5` 语义向量（512 维，CPU 可跑，query 侧加 bge 官方检索指令前缀提升召回），未安装 sentence-transformers 时自动降级为中文 2-gram 哈希 embedding（`HashingEmbeddingFunction`，特征哈希 + L2 归一化，无模型、无网络依赖开箱即用）；统一 `encode_documents / encode_query` 接口，新增后端（如 DashScope 云端 embedding）只需实现同一接口；独立改写评测集对比实验见 `scripts/rag_eval.py`。
 - **Prometheus Alertmanager 对接**：`POST /api/v1/webhook/alertmanager` 接收 Alertmanager v4 标准推送，labels/annotations 全量保留供检索 Agent 提取关键词；resolved 通知自动过滤、重复 fingerprint 幂等受理；`scripts/mock_alertmanager.py` 可模拟真实告警源持续推送。
 - **MCP 工具异步队列**：报告导出（JSON/Markdown/Excel .xlsx）、预警发送（落库 + 可选 Webhook 真实推送）、备注追加等工具经 `AsyncToolQueue` 异步入队、后台消费，主流程不阻塞；队列支持**幂等去重、令牌桶限流、指数退避重试、失败隔离与 Dead Letter Queue**，任务状态经 **SSE 实时推送**前端。
 - **分层记忆 + 上下文压缩**：短期 Redis 热窗口 + 长期 MySQL（`chat_kv` 表 + 联合索引）+ SQLite 兜底；长对话经「保留最近 N 条 + 摘要压缩」生成 `memoryBrief`，避免 prompt 膨胀，支持可配置归档。
@@ -169,6 +169,20 @@ python scripts/rag_eval.py          # 四象限对比：{hashing, bge} × {exact
 | paraphrase | 独立改写的运维口语描述（规避原文关键词） | 模拟真实告警与知识库措辞不一致，考察语义泛化 |
 
 评测在独立临时目录建库，不污染生产数据。**关注点：paraphrase 口径下 bge 相对 hashing 的增益**——这是语义向量相对词法匹配的真实价值，可直接作为技术选型依据写入报告。
+
+### 为什么选本地 bge 而非云端 DashScope embedding
+
+本项目默认采用**本地 `bge-small-zh-v1.5`**，而非阿里 DashScope 等云端 embedding，是面向 AIOps 内网场景的权衡：
+
+| 维度 | 本地 bge（已选） | 云端 DashScope |
+|---|---|---|
+| 网络 | 离线可用，契合内网/隔离环境 | 需访问公网，断网即废 |
+| 数据隐私 | 故障文本不出本机 | 文本需发往第三方云 |
+| 成本 | 模型一次性下载，零调用费 | 按 token 计费 |
+| 兜底 | 无 sentence-transformers 时降级 hashing，连模型都不需 | 无网络则完全不可用 |
+| 能力 | 小模型，语义弱于云端大模型 | 语义更强（text-embedding-v2/v3） |
+
+**取舍结论**：AIOps 场景优先保障「数据不出内网 + 离线可用 + 零调用成本」，本地 bge + hashing 兜底为此服务；代价是语义能力弱于云端大模型。如需更强语义，可在 `knowledge_base.py` 的 `resolve_embedding_backend` 体系下新增 `DashScopeEmbeddingFunction`（实现统一的 `encode_documents / encode_query` 接口），`EMBEDDING_BACKEND` 配置即切换，无需改动检索链路。
 
 ### 压测基准（Locust）
 

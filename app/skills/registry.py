@@ -24,7 +24,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from app.skills.executor import SkillExecutor, StepResult
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # 仅类型提示，避免运行时依赖已移除的 executor 模块
+    from app.skills.executor import SkillExecutor, StepResult
 
 logger = logging.getLogger(__name__)
 
@@ -70,37 +73,41 @@ class AIOpsSkill:
     async def execute(
         self,
         context: dict,
-        executor: Optional[SkillExecutor] = None,
+        executor: Optional["SkillExecutor"] = None,
         safety_review: Optional[Callable[[str, str], Any]] = None,
     ) -> dict:
-        """执行 Skill：调用真实动作执行层，并返回处置计划 + 执行结果。
+        """执行 Skill：返回结构化处置计划与交接摘要。
 
-        - executor 为 None 时自动构建一个（按 config 惰性连接/降级）。
-        - 只读诊断真实执行；危险动作经安全门控制，默认仅生成处置计划。
+        当前 Skill 为声明式处置剧本，危险动作默认仅生成处置计划不自动执行；
+        若上层传入 executor（真实动作执行层）则调用其执行只读诊断。
         """
-        if executor is None:
-            executor = SkillExecutor(safety_review=safety_review)
-        try:
-            results: list[StepResult] = await executor.execute(self, context)
-        finally:
-            await executor.close()
+        if executor is not None:
+            results = await executor.execute(self, context)
+            executed = [r for r in results if r.status == "executed"]
+            blocked = [r for r in results if r.status == "blocked"]
+            degraded = [r for r in results if r.status == "degraded"]
+            return {
+                "skill": self.name,
+                "status": "executed" if executed else "plan_only",
+                "risk_level": self.risk_level,
+                "plan_steps": [s.type for s in self.steps],
+                "execution": [r.__dict__ for r in results],
+                "summary": {
+                    "executed": len(executed),
+                    "blocked": len(blocked),
+                    "degraded": len(degraded),
+                },
+                "handover_summary": self.handover_summary(context),
+            }
 
-        # 统计执行情况
-        executed = [r for r in results if r.status == "executed"]
-        blocked = [r for r in results if r.status == "blocked"]
-        degraded = [r for r in results if r.status == "degraded"]
-
+        # 未注入 executor：仅产出处置计划 + 交接摘要（默认行为）
         return {
             "skill": self.name,
-            "status": "executed" if executed else "plan_only",
+            "status": "plan_only",
             "risk_level": self.risk_level,
             "plan_steps": [s.type for s in self.steps],
-            "execution": [r.__dict__ for r in results],
-            "summary": {
-                "executed": len(executed),
-                "blocked": len(blocked),
-                "degraded": len(degraded),
-            },
+            "execution": [],
+            "summary": {"executed": 0, "blocked": 0, "degraded": 0},
             "handover_summary": self.handover_summary(context),
         }
 

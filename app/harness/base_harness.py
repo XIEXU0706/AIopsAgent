@@ -27,7 +27,7 @@ from app.agents.coordinator import CoordinatorAgent
 from app.agents.log_analyzer import LogAnalyzeAgent
 from app.agents.retrieval_agent import RetrievalAgent
 from app.agents.safety_agent import SafetyAgent
-from app.mcp.tools import excel_export, send_notification, append_note
+from app.mcp.tools import excel_export, send_notification, append_note, query_metrics
 from app.blackboard.blackboard import CollaborationBlackboard
 from app.models.report import DispositionReport
 from app.mcp import AsyncToolQueue, ToolTask
@@ -89,6 +89,7 @@ class AIOpsAgentHarness:
         queue.register_handler("excel_export", excel_export)
         queue.register_handler("send_notification", send_notification)
         queue.register_handler("append_note", append_note)
+        queue.register_handler("query_metrics", query_metrics)
 
     def start_tool_queue(self) -> None:
         """启动后台工具队列处理循环"""

@@ -18,13 +18,22 @@
     python scripts/rag_eval.py --backends hashing --mode paraphrase
     python scripts/rag_eval.py --backends bge --mode exact --top-k 3
 
+    # 对比检索增强：纯向量 vs 混合检索 vs 混合+重排（bge 下）
+    python scripts/rag_eval.py --backends bge --mode paraphrase --enhance
+
+    # 切换 bge-large（需 sentence-transformers 支持，独立集合自动重建）
+    BGE_MODEL_NAME=BAAI/bge-large-zh-v1.5 BGE_DIM=1024 python scripts/rag_eval.py --backends bge
+
 说明：
   - 评测在独立临时目录建库，不污染生产 data/chroma。
   - bge backend 需要 sentence-transformers（pip install sentence-transformers），
-    首次运行会下载 bge-small-zh-v1.5 模型（约 100MB，CPU 可跑）。
+    首次运行会下载 bge 模型（small 约 100MB / large 约 1.2GB，CPU 可跑但较慢）。
+  - --enhance 会构造三组实验：vector（仅向量召回）、hybrid（向量+RRF 融合关键词）、
+    rerank（hybrid + LLM/本地重排），量化检索增强的真实增益。
 """
 
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -33,10 +42,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from app import config
 from app.services.knowledge_base import (
     BUILTIN_CASES,
     KnowledgeBaseService,
 )
+
+# 评测专用：临时改写 rag 增强开关，避免污染全局配置
+def _with_enhance(hybrid: bool, rerank: bool):
+    prev_h, prev_r = config.settings.rag_hybrid, config.settings.rag_rerank
+    config.settings.rag_hybrid = hybrid
+    config.settings.rag_rerank = rerank
+    return prev_h, prev_r
+
+def _restore(prev_h, prev_r):
+    config.settings.rag_hybrid, config.settings.rag_rerank = prev_h, prev_r
 
 
 # ── 评测集 ──────────────────────────────────────────────────
@@ -93,6 +113,10 @@ def main():
         help="评测口径（默认 both：两种口径都测）",
     )
     parser.add_argument("--show-miss", action="store_true", help="打印未命中的明细")
+    parser.add_argument(
+        "--enhance", action="store_true",
+        help="bge 下对比 vector / hybrid / rerank 三组检索增强实验",
+    )
     args = parser.parse_args()
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
@@ -123,24 +147,46 @@ def main():
                   f"（bge 模型不可用？）")
 
         for mode in modes:
-            hit_rate, mrr, n, misses = evaluate(svc, eval_sets[mode], args.top_k)
-            rows.append((effective, mode, n, hit_rate, mrr))
-            for q, gt, got in misses:
-                all_misses.append((effective, mode, q, gt, got))  # type: ignore[arg-type]
+            if args.enhance and svc._backend == "bge":
+                # 同一服务实例上对比三组检索增强（集合已建好，仅切开关）
+                experiments = [
+                    ("vector", False, False),
+                    ("hybrid", True, False),
+                    ("rerank", True, True),
+                ]
+                for tag, h, r in experiments:
+                    prev = _with_enhance(h, r)
+                    try:
+                        hit_rate, mrr, n, misses = evaluate(svc, eval_sets[mode], args.top_k)
+                    finally:
+                        _restore(*prev)
+                    label = f"bge+{tag}"
+                    rows.append((label, mode, n, hit_rate, mrr))
+                    for q, gt, got in misses:
+                        all_misses.append((label, mode, q, gt, got))  # type: ignore[arg-type]
+            else:
+                hit_rate, mrr, n, misses = evaluate(svc, eval_sets[mode], args.top_k)
+                rows.append((effective, mode, n, hit_rate, mrr))
+                for q, gt, got in misses:
+                    all_misses.append((effective, mode, q, gt, got))  # type: ignore[arg-type]
 
     # ── 输出对比表 ──
     print("=" * 64)
     print("RAG 检索质量对比实验（哈希 embedding vs BGE 语义 embedding）")
     print("=" * 64)
-    print(f"{'backend':<10} {'口径':<12} {'样本':<4} {'HitRate@%d':<14} {'MRR@%d':<10}"
+    print(f"{'backend':<14} {'口径':<12} {'样本':<4} {'HitRate@%d':<14} {'MRR@%d':<10}"
           % (args.top_k, args.top_k))
     print("-" * 64)
     for backend, mode, n, hit_rate, mrr in rows:
-        print(f"{backend:<10} {mode:<12} {n:<4} {hit_rate:<14.4f} {mrr:<10.4f}")
+        print(f"{backend:<14} {mode:<12} {n:<4} {hit_rate:<14.4f} {mrr:<10.4f}")
     print("=" * 64)
     print("口径说明:")
     print("  exact      = query 为案例症状原文（同分布，基线参考，必然偏高）")
     print("  paraphrase = query 为独立改写的运维描述（规避原文关键词，考察语义泛化）")
+    if args.enhance:
+        print("  bge+vector = 仅 bge 向量召回")
+        print("  bge+hybrid = 向量 + 关键词 2-gram 召回，RRF 融合")
+        print("  bge+rerank = hybrid + LLM/本地重排")
 
     if all_misses:
         print(f"\n未命中明细（共 {len(all_misses)} 条）:")
@@ -148,8 +194,8 @@ def main():
             print(f"  [{backend}/{mode}] query: {q}")
             print(f"    期望: {gt}  实际 top{args.top_k}: {got}")
 
-    print("\n结论提示：对比 paraphrase 口径下两种 backend 的差距，")
-    print("即为语义向量相对词法哈希的泛化增益（可直接写入简历/报告）。")
+    print("\n结论提示：对比 paraphrase 口径下各组的差距，")
+    print("即为语义向量 / 混合检索 / 重排带来的泛化增益（可直接写入简历/报告）。")
 
 
 if __name__ == "__main__":
